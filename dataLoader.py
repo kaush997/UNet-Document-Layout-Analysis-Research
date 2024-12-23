@@ -2,115 +2,145 @@ import os
 import pandas as pd
 import numpy as np
 import cv2
+import torch
+from torch.utils.data import Dataset, DataLoader
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
 
-class DocumentLayoutDataset(Dataset):
-    def __init__(self, images_dir, labels_dir, csv_path, augmentations=None):
+
+class EnhancedDocumentLayoutDataset(Dataset):
+    # Define default transforms
+    DEFAULT_TRANSFORMS = A.Compose([
+        A.Resize(height=512, width=512, p=1.0),
+        A.OneOf([
+            A.RandomBrightnessContrast(brightness_limit=0.01, contrast_limit=0.01, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=2, sat_shift_limit=2, val_shift_limit=2, p=0.5),
+        ], p=0.5),
+        A.ToGray(p=0.5),
+        ToTensorV2()
+    ])
+
+    def __init__(self,
+                 images_dir: str,
+                 labels_dir: str,
+                 csv_path: str,
+                 transform: bool = True,
+                 custom_transforms: A.Compose = None,
+                 image_size: tuple = (512, 512)):
         """
-        Initializes the dataset for document layout analysis.
+        Enhanced dataset for document layout analysis.
 
-        :param images_dir: Path to the directory containing images.
-        :param labels_dir: Path to the directory containing labels (multi-class masks).
-        :param csv_path: Path to the CSV file mapping images to labels.
-        :param augmentations: Albumentations augmentation pipeline.
+        Args:
+            images_dir (str): Directory containing input images
+            labels_dir (str): Directory containing label masks
+            csv_path (str): Path to CSV file mapping images to labels
+            transform (bool): Whether to apply transformations
+            custom_transforms (A.Compose): Optional custom transformation pipeline
+            image_size (tuple): Target size for images and masks
         """
         self.images_dir = images_dir
         self.labels_dir = labels_dir
         self.data = pd.read_csv(csv_path)
-        self.augmentations = augmentations
+        self.transform = transform
+        self.image_size = image_size
+        self.transforms = custom_transforms if custom_transforms else self.DEFAULT_TRANSFORMS
 
+        # Validate paths and data
+        self._validate_setup()
+
+    def _validate_setup(self):
+        """Validate dataset setup and paths."""
         if self.data.empty:
-            raise ValueError(f"CSV file at {csv_path} is empty or incorrectly formatted.")
+            raise ValueError(f"CSV file is empty or incorrectly formatted")
 
-    def __len__(self):
+        # Check if directories exist
+        if not os.path.exists(self.images_dir):
+            raise ValueError(f"Images directory not found: {self.images_dir}")
+        if not os.path.exists(self.labels_dir):
+            raise ValueError(f"Labels directory not found: {self.labels_dir}")
+
+        # Validate file existence (first few entries)
+        for _, row in self.data.head().iterrows():
+            img_path = os.path.join(self.images_dir, row.iloc[0])
+            label_path = os.path.join(self.labels_dir, row.iloc[1])
+            if not os.path.exists(img_path):
+                raise ValueError(f"Image file not found: {img_path}")
+            if not os.path.exists(label_path):
+                raise ValueError(f"Label file not found: {label_path}")
+
+    def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx):
-        # Load image and corresponding label
-        image_name = self.data.iloc[idx, 0]  # Assumes image filename is in the first column
-        label_name = self.data.iloc[idx, 1]  # Assumes label filename is in the second column
+    def _load_image(self, path: str) -> np.ndarray:
+        """Load and preprocess image."""
+        image = cv2.imread(path)
+        if image is None:
+            raise ValueError(f"Failed to load image: {path}")
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        image_path = os.path.join(self.images_dir, image_name)
+    def _load_mask(self, path: str) -> np.ndarray:
+        """Load and preprocess mask."""
+        mask = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise ValueError(f"Failed to load mask: {path}")
+        return mask if len(mask.shape) == 2 else mask[:, :, 0]
+
+    def __getitem__(self, idx: int) -> tuple:
+        # Get file paths
+        img_name = self.data.iloc[idx, 0]
+        label_name = self.data.iloc[idx, 1]
+
+        img_path = os.path.join(self.images_dir, img_name)
         label_path = os.path.join(self.labels_dir, label_name)
 
-        if not os.path.exists(image_path):
-            print(f"Warning: Image file not found: {image_path}. Skipping.")
-            return self.__getitem__((idx + 1) % len(self))
-        if not os.path.exists(label_path):
-            print(f"Warning: Label file not found: {label_path}. Skipping.")
-            return self.__getitem__((idx + 1) % len(self))
+        # Load files
+        try:
+            image = self._load_image(img_path)
+            mask = self._load_mask(label_path)
+        except Exception as e:
+            print(f"Error loading files for index {idx}: {str(e)}")
+            # Skip to next item if available
+            return self.__getitem__((idx + 1) % len(self)) if len(self) > 1 else None
 
-        image = cv2.imread(image_path)
-        if image is None:
-            raise ValueError(f"Failed to load image file: {image_path}")
+        # Resize to target size
+        image = cv2.resize(image, self.image_size, interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, self.image_size, interpolation=cv2.INTER_NEAREST)
 
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Apply transformations if enabled
+        if self.transform:
+            try:
+                augmented = self.transforms(image=image, mask=mask)
+                image = augmented['image']
+                mask = augmented['mask']
+            except Exception as e:
+                print(f"Warning: Transform failed for index {idx}: {str(e)}")
+                # Return non-transformed data if transform fails
+                image = torch.from_numpy(image.transpose(2, 0, 1))
+                mask = torch.from_numpy(mask)
 
-        label = cv2.imread(label_path, cv2.IMREAD_UNCHANGED)  # Loads as a single-channel mask
-        if label is None:
-            raise ValueError(f"Failed to load label file: {label_path}")
+        return image, mask.long()
 
-        # Ensure the label is a 2D numpy array
-        if len(label.shape) == 3:
-            label = label[:, :, 0]
-
-        # Resize image and label to a fixed size
-        target_size = (256, 256)  # Example target size; adjust as needed
-        image = cv2.resize(image, target_size, interpolation=cv2.INTER_LINEAR)
-        label = cv2.resize(label, target_size, interpolation=cv2.INTER_NEAREST)
-
-        if self.augmentations:
-            augmented = self.augmentations(image=image, mask=label)
-            image = augmented['image']
-            label = augmented['mask']
-
-        return image, label
-
-# Albumentations augmentation pipeline
-augmentations = A.Compose([
-    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
-    A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=30, val_shift_limit=20, p=0.5),
-    A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-    A.ToGray(p=0.3),  # Convert some images to grayscale
-    A.Rotate(limit=3, p=0.5),
-    ToTensorV2()
-])
 
 if __name__ == "__main__":
-    # Define dataset paths
-    images_dir = "data/images"
-    labels_dir = "data/combined_labels"
-    csv_path = "data/image_label_mapping.csv"
+    # Example usage
+    dataset = EnhancedDocumentLayoutDataset(
+        images_dir="data/images",
+        labels_dir="data/combined_labels",
+        csv_path="data/image_label_mapping.csv",
+        image_size=(512, 512)
+    )
 
-    # Load the CSV file
-    try:
-        data = pd.read_csv(csv_path)
-    except Exception as e:
-        raise FileNotFoundError(f"Error loading CSV file: {e}")
+    dataloader = DataLoader(
+        dataset,
+        batch_size=16,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
 
-    # Split the data into training, validation, and testing sets
-    train_data, test_data = train_test_split(data, test_size=0.2, random_state=42)
-    train_data, val_data = train_test_split(train_data, test_size=0.25, random_state=42)  # 0.25 x 0.8 = 0.2
-
-    # Save splits to CSV files
-    train_data.to_csv("data/train_split.csv", index=False)
-    val_data.to_csv("data/val_split.csv", index=False)
-    test_data.to_csv("data/test_split.csv", index=False)
-
-    print("Dataset splits created:")
-    print(f"Training set: {len(train_data)} samples")
-    print(f"Validation set: {len(val_data)} samples")
-    print(f"Test set: {len(test_data)} samples")
-
-    # Initialize dataset and data loader for training set as an example
-    dataset = DocumentLayoutDataset(images_dir, labels_dir, "data/train_split.csv", augmentations=augmentations)
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=4)
-
-    # Example: Iterate through one batch
-    for images, labels in dataloader:
-        print(f"Image batch shape: {images.shape}")
-        print(f"Label batch shape: {labels.shape}")
+    # Test the dataloader
+    for batch_idx, (images, masks) in enumerate(dataloader):
+        print(f"Batch {batch_idx}:")
+        print(f"Images shape: {images.shape}")
+        print(f"Masks shape: {masks.shape}")
         break
