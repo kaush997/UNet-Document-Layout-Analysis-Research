@@ -232,8 +232,8 @@ if __name__ == "__main__":
         'num_epochs': 100,
         'images_dir': 'data/images',
         'labels_dir': 'data/combined_labels',
-        'train_csv': 'data/splits/train.csv',
-        'val_csv': 'data/splits/val.csv',
+        'train_csv': 'data/train.csv',
+        'val_csv': 'data/val.csv',
         'checkpoint_dir': 'checkpoints',
         'use_wandb': False,  # Set to False by default to avoid authentication issues
     }

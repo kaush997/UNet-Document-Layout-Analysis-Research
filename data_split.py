@@ -50,7 +50,7 @@ if __name__ == "__main__":
     # Example usage
     split_dataset(
         csv_path="data/image_label_mapping.csv",
-        output_dir="data/splits",
+        output_dir="data",
         train_ratio=0.7,
         val_ratio=0.2,
         test_ratio=0.1
