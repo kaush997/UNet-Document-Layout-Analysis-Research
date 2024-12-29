@@ -14,6 +14,8 @@ class EnhancedDocumentLayoutDataset(Dataset):
         self.image_size = image_size
         self.transform = transform or A.Compose([
             A.Resize(image_size[0], image_size[1]),
+            A.RandomBrightnessContrast(brightness_limit=0.01,contrast_limit=0.01),
+            A.HueSaturationValue(hue_shift_limit=2,sat_shift_limit=2,val_shift_limit=2),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2()
         ])
